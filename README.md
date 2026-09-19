@@ -20,6 +20,27 @@ appear as native stream cards.
 Searches walk the mirror list in order; the first mirror that answers wins
 (positive-cached per term).
 
+## The movielinkbd.li front (v1.2.0, user directive)
+
+`u7n8gg.movielinkbd.li` is the current front of the family's custom app:
+hash/slug movie pages, `/search?q=`, tokenised `getWatch` (watch online) and
+`getLink` (download, label carries quality + size) endpoints, TMDB-keyed
+posters. Its library is larger than the WordPress mirrors (e.g. *The Gift*
+(2015) exists only there).
+
+As of 2026-09-19 **every server-side request to it is Cloudflare-challenged**
+(verified from this sandbox, from curl_cffi Chrome-impersonation, from
+cloudscraper, from the jina.ai renderer and — via `/debug/li` — from the
+beamup host itself: all 403 "Just a moment"). The addon therefore:
+
+1. tries the `.li` front first on every request (fast fail on 403),
+2. falls through to the open WordPress mirrors of the same team,
+3. auto-activates the `.li` library (search + page + getWatch/getLink
+   extraction, real-archived-fixture tested) the moment the gate lifts.
+
+The rotating prefix (`u7n8gg`, previously `2f2w3j`) is configurable via the
+`MLSBD_LI_FRONT` env var.
+
 ## How it works
 
 1. `tt…` ids resolve through Cinemeta, `tmdb:` ids through TMDB

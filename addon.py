@@ -45,7 +45,7 @@ from urllib.parse import urlparse, parse_qs, quote, unquote
 import requests
 
 # ----------------------------------------------------------------- 1. config
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 BRAND = "MovieLinkBD"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MLSBD_PUBLIC_URL", "").rstrip("/")
@@ -68,6 +68,14 @@ MIRRORS = [
     "https://movielinkbd.shop",
 ]
 SEARCH_PATH = "/wp-json/mlmbd/v1/search"      # ?term=<q> -> [{link,title,image}]
+
+# The current movielinkbd.li front (user directive 2026-09-19): a custom
+# hash/slug app with tokenised getWatch/getLink endpoints.  Cloudflare
+# challenges every server-side request right now (verified from the addon
+# host too via /debug/li); the adapter stays armed and auto-activates the
+# moment the challenge lifts.  The prefix (u7n8gg) rotates — update
+# LI_FRONT when the site moves.
+LI_FRONT = os.environ.get("MLSBD_LI_FRONT", "https://u7n8gg.movielinkbd.li")
 SIGN_API = "https://dl.vircloud.site/api/sign/"
 HTTP_TIMEOUT = 12.0
 PROBE_TIMEOUT = 15.0
@@ -230,6 +238,116 @@ def mirror_search(mirror, term):
     if results:
         C_SEARCH.put(key, results, 1800)
     return results
+
+
+# ----------------------------------------------------- 4b. movielinkbd.li app
+def _li_challenge(text):
+    """Cloudflare interstitial? (managed challenge blocks all server IPs)"""
+    head = (text or "")[:4000]
+    return "Just a moment" in head or "cf-challenge" in head
+
+
+def li_search(term):
+    """Search the .li app: /search?q= -> movie-card rows.
+
+    Returns (status, rows) with status in {"ok", "blocked", "empty"}.
+    """
+    try:
+        r = HTTP.get(LI_FRONT + "/search", params={"q": term},
+                     timeout=HTTP_TIMEOUT, headers={"Referer": LI_FRONT + "/"})
+    except Exception:
+        return "blocked", []
+    if r.status_code == 403 or _li_challenge(r.text):
+        return "blocked", []
+    if r.status_code != 200:
+        return "empty", []
+    rows = []
+    # movie-card blocks: <div class="movie-card" ...> ... <a href=".../movie/<id>"
+    # class="title">Title (YYYY)</a>
+    for m in re.finditer(
+            r'<a href="([^"]*?/movie/[A-Za-z0-9_+-]{6,120})"\s+class="title">([^<]+)</a>',
+            r.text):
+        link, title = m.group(1), clean_text(m.group(2))
+        if link and title:
+            if not link.startswith("http"):
+                link = LI_FRONT + link
+            rows.append({"link": link, "title": title})
+    return ("ok" if rows else "empty"), rows
+
+
+def li_page_buttons(page_url):
+    """Parse a .li movie page into watch/download buttons.
+
+    Ground truth (wayback snapshot 2026-03-11, 'The Gift (2015)'):
+      /getWatch/<b64(b64(cipher))>  — Watch Online
+      /getLink/<b64(b64(cipher))>   — Download [720p • 700 MB]
+    The button LABEL carries the quality/size (there is no other honest
+    source on this app).
+    """
+    files = []
+    try:
+        r = HTTP.get(page_url, timeout=HTTP_TIMEOUT,
+                     headers={"Referer": LI_FRONT + "/"})
+        if r.status_code != 200 or _li_challenge(r.text):
+            return []
+        body = r.text
+    except Exception:
+        return []
+    for m in re.finditer(
+            r'<a[^>]+href="([^"]*?)/(getWatch|getLink)/([A-Za-z0-9+/=_-]{20,})"[^>]*>(.*?)</a>',
+            body, re.S):
+        front, kind, token = m.group(1), m.group(2), m.group(3)
+        label = re.sub(r"<[^>]+>|\s+", " ", m.group(4)).strip()
+        quality = (re.search(r"\b(2160|1080|720|480|360)p?\b", label) or [None, ""])[1]
+        quality = quality if quality.endswith("p") and quality != "p" else (quality + "p" if quality else "")
+        size = (re.search(r"(\d+(?:\.\d+)?\s*(?:MB|GB))", label, re.I) or [None, ""])[1]
+        entry = {"front": front, "kind": kind, "token": token,
+                 "label": label, "quality": quality, "size": size,
+                 "ep_lo": None, "ep_hi": None, "ext": ""}
+        if entry not in files:
+            files.append(entry)
+    return files
+
+
+FILE_URL_RE = re.compile(
+    r'https?://[^"\'<>\s\\]+?\.(?:m3u8|mp4|mkv|webm|avi|m4v)(?:\?[^"\'<>\s\\]*)?',
+    re.I)
+
+
+def li_button_links(entry):
+    """Follow one getWatch/getLink token and pull direct file URLs out.
+
+    The response shape is unknown until the Cloudflare gate lifts, so this
+    extracts defensively: direct media URLs, meta-refresh targets and plain
+    redirects are all accepted.  Positive-only: nothing is guessed.
+    """
+    url = entry["front"] + "/" + entry["kind"] + "/" + entry["token"]
+    try:
+        r = HTTP.get(url, timeout=HTTP_TIMEOUT, stream=True,
+                     allow_redirects=True, headers={"Referer": LI_FRONT + "/"})
+        if r.status_code != 200 or _li_challenge(getattr(r, "text", "")):
+            r.close()
+            return []
+        body = r.text if hasattr(r, "text") else ""
+        r.close()
+    except Exception:
+        return []
+    urls = []
+    for u in FILE_URL_RE.findall(body):
+        if u not in urls:
+            urls.append(u)
+    # The family's own CDN signs extension-less /download/<b64> URLs.
+    for u in re.findall(r'https?://dl\.vircloud\.site/download/[A-Za-z0-9+/=_-]+',
+                        body):
+        if u not in urls:
+            urls.append(u)
+    for m in re.finditer(
+            r'(?:http-equiv="refresh"[^>]+url=|window\.location(?:\.href)?\s*=\s*["\'])([^"\';]+)',
+            body, re.I):
+        u = m.group(1).strip()
+        if u.startswith("http") and u not in urls:
+            urls.append(u)
+    return urls
 
 
 def _title_score(query, candidate):
@@ -419,6 +537,45 @@ def _card(entry, signed, mirror, is_series):
     return stream
 
 
+def _li_card(entry, url):
+    parts = [x for x in (entry.get("quality"), entry.get("size")) if x]
+    ext = ""
+    m = re.search(r"\.(mkv|mp4|webm|m4v|avi)(?:\?|$)", url, re.I)
+    if m:
+        ext = m.group(1).upper()
+        parts.append(ext)
+    name = "♧ %s · %s" % (BRAND, " · ".join(parts) if parts else "Direct")
+    return {"name": name, "title": entry.get("label", "")[:80], "url": url,
+            "behaviorHints": {"notWebReady": ext != "MP4"}}
+
+
+def _li_try(title, year, is_series, season, episode):
+    """Try the movielinkbd.li app first.  Returns a streams dict when it
+    produced verified cards, else None so the WordPress mirrors answer."""
+    status, rows = li_search(title)
+    if status != "ok":
+        return None
+    row = best_result(rows, title, year)
+    if not row:
+        return None
+    buttons = li_page_buttons(row["link"])
+    if not buttons:
+        return None
+    streams = []
+    for entry in buttons:
+        for url in li_button_links(entry)[:2]:
+            hit, ok = C_PROBE.get(entry["token"] + url[-24:])
+            if not hit:
+                ok = probe_file(url)
+                if ok:
+                    C_PROBE.put(entry["token"] + url[-24:], True, 600)
+            if ok:
+                streams.append(_li_card(entry, url))
+    if not streams:
+        return None
+    return {"streams": streams[:12], "message": ""}
+
+
 def build_streams(identifier, season=None, episode=None):
     """Full pipeline: id -> mirror search -> page -> signed direct cards.
 
@@ -437,6 +594,11 @@ def build_streams(identifier, season=None, episode=None):
     title, year = resolved
     is_series = episode is not None
     STATS["searches"] += 1
+    # The .li app goes first (user directive).  While its Cloudflare gate
+    # blocks servers this returns None instantly and the mirrors answer.
+    li_out = _li_try(title, year, is_series, season, episode)
+    if li_out is not None:
+        return li_out
     # The wp-json search is literal: 'Dune: Part One' finds nothing while
     # 'Dune' does.  Try the full title, then its pre-colon head.
     terms = _title_variants(title)

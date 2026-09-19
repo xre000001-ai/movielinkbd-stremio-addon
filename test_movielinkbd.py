@@ -321,6 +321,134 @@ class StreamTests(unittest.TestCase):
         self.assertEqual(len(probes), 1)
 
 
+class LiAdapterTests(unittest.TestCase):
+    """movielinkbd.li adapter — fixtures pinned from the wayback snapshot
+    of https://2f2w3j.movielinkbd.li/movie/1is9Hh_… ('The Gift (2015)')."""
+
+    def setUp(self):
+        reset_caches()
+
+    def test_challenge_detected(self):
+        self.assertTrue(addon._li_challenge(
+            "<!DOCTYPE html><html><head><title>Just a moment...</title>"))
+        self.assertFalse(addon._li_challenge("<html><title>The Gift</title>"))
+
+    def test_li_search_parses_movie_cards(self):
+        body = """
+        <div class="movie-card" data-18="0">
+          <div class="image-container"><a href="https://u7n8gg.movielinkbd.li/movie/1is9Hh_Tu3VMHsruWQnBCkufSypBVcAJdVxvWGazdLgIvdu6XHvI-xQYhGLpiolRK3gnIA">
+          <img alt="The Gift (2015)" title="The Gift (2015)"/></a>
+          <span class="quality">WEB-DL</span><span class="type type-movie">Movie</span></div>
+          <div class="content"><a href="https://u7n8gg.movielinkbd.li/movie/1is9Hh_Tu3VMHsruWQnBCkufSypBVcAJdVxvWGazdLgIvdu6XHvI-xQYhGLpiolRK3gnIA" class="title">The Gift (2015)</a></div>
+        </div>"""
+        with mock.patch.object(addon.HTTP, "get",
+                               return_value=FakeResponse(body=body)):
+            status, rows = addon.li_search("the gift")
+        self.assertEqual(status, "ok")
+        self.assertEqual(rows[0]["title"], "The Gift (2015)")
+        self.assertIn("/movie/1is9Hh_", rows[0]["link"])
+
+    def test_li_search_blocked_by_cloudflare(self):
+        cf = "<!DOCTYPE html><html><head><title>Just a moment...</title></head>"
+        with mock.patch.object(addon.HTTP, "get",
+                               return_value=FakeResponse(status=403, body=cf)):
+            status, rows = addon.li_search("the gift")
+        self.assertEqual((status, rows), ("blocked", []))
+
+    def test_li_page_buttons_parses_watch_and_download(self):
+        tok_w = "bVc2QlNMK2Fq" + "A" * 40
+        tok_d = "aVVMTnBXdWZEMDZG" + "B" * 40
+        page = """
+        <h1>The Gift (2015)</h1>
+        <a href="https://u7n8gg.movielinkbd.li/getWatch/%s" class="btn">
+          <b><i class="fas fa-play-circle"></i> Watch Online</b></a>
+        <a href="https://u7n8gg.movielinkbd.li/getLink/%s" class="btn">
+          <b><i class="fas fa-cloud-download-alt"></i> Download [720p • 700 MB]</b></a>
+        """ % (tok_w, tok_d)
+        with mock.patch.object(addon.HTTP, "get",
+                               return_value=FakeResponse(body=page)):
+            buttons = addon.li_page_buttons("https://u7n8gg.movielinkbd.li/movie/x")
+        self.assertEqual(len(buttons), 2)
+        watch = [b for b in buttons if b["kind"] == "getWatch"][0]
+        down = [b for b in buttons if b["kind"] == "getLink"][0]
+        self.assertEqual(watch["token"], tok_w)
+        self.assertEqual(down["quality"], "720p")
+        self.assertEqual(down["size"], "700 MB")
+
+    def test_li_button_links_extracts_direct_and_refresh(self):
+        body = ('<html><head><meta http-equiv="refresh" content="5;url='
+                'https://dl.example.com/file-1080p.mkv"></head>'
+                '<body><a href="https://cdn.example.com/video.mp4">go</a></body></html>')
+        with mock.patch.object(addon.HTTP, "get",
+                               return_value=FakeResponse(body=body)):
+            urls = addon.li_button_links(
+                {"front": "https://u7n8gg.movielinkbd.li",
+                 "kind": "getLink", "token": "x" * 30})
+        self.assertIn("https://cdn.example.com/video.mp4", urls)
+        self.assertIn("https://dl.example.com/file-1080p.mkv", urls)
+
+    def test_li_try_falls_back_when_blocked(self):
+        cf = "<html><title>Just a moment...</title></html>"
+        cinemeta = FakeResponse(json_value={"meta": {"name": "Interstellar",
+                                                     "releaseInfo": "2014"}})
+        wp = FakeResponse(json_value=[{
+            "link": "https://movieslinkbd.com/interstellar-2014-hindi-english-download-watch-online/",
+            "title": "Interstellar (2014) [Hindi & English] Download & Watch Online"}])
+        page = FakeResponse(body=page_html([b64(INTERSTELLAL_NAME)]))
+        sign = FakeResponse(json_value={
+            "downloadUrl": "https://dl.vircloud.site/download/x?exp=9999999999&sig=1"})
+        probe = FakeResponse(status=206)
+
+        def route(url, **kw):
+            if "cinemeta" in url:
+                return cinemeta
+            if "u7n8gg.movielinkbd.li" in url:
+                return FakeResponse(status=403, body=cf)   # .li is CF-blocked
+            if "wp-json" in url:
+                return wp
+            if "download-watch-online" in url:
+                return page
+            if "/api/sign/" in url:
+                return sign
+            if "dl.vircloud.site/download/" in url:
+                return probe
+            return FakeResponse(status=404, body="{}")
+        with mock.patch.object(addon.HTTP, "get", side_effect=UrlRouter(route)):
+            out = addon.build_streams("tt0816692")
+        # .li blocked -> transparent fallback to the WP mirror library.
+        self.assertEqual(len(out["streams"]), 1)
+        self.assertIn("MovieLinkBD", out["streams"][0]["name"])
+
+    def test_li_try_serves_cards_when_open(self):
+        tok_d = "T" * 60
+        search_body = """
+        <div class="content"><a href="https://u7n8gg.movielinkbd.li/movie/hashgift" class="title">The Gift (2015)</a></div>"""
+        movie_page = """
+        <a href="https://u7n8gg.movielinkbd.li/getLink/%s" class="btn">
+          Download [720p • 700 MB]</a>""" % tok_d
+        getlink_page = ('<a href="https://dl.vircloud.site/download/GIFT?exp=9999999999&sig=2">get</a>')
+        cinemeta = FakeResponse(json_value={"meta": {"name": "The Gift",
+                                                     "releaseInfo": "2015"}})
+
+        def route(url, **kw):
+            if "cinemeta" in url:
+                return cinemeta
+            if "/search" in url and "u7n8gg" in url:
+                return FakeResponse(body=search_body)
+            if "/movie/hashgift" in url:
+                return FakeResponse(body=movie_page)
+            if "/getLink/" in url:
+                return FakeResponse(body=getlink_page)
+            if "dl.vircloud.site/download/" in url:
+                return FakeResponse(status=206)
+            return FakeResponse(status=404, body="{}")
+        with mock.patch.object(addon.HTTP, "get", side_effect=UrlRouter(route)):
+            out = addon.build_streams("tt0000000")
+        self.assertEqual(len(out["streams"]), 1)
+        self.assertIn("720p", out["streams"][0]["name"])
+        self.assertIn("700 MB", out["streams"][0]["name"])
+
+
 class ServerSmokeTests(unittest.TestCase):
     def test_routes_via_handler(self):
         import threading
