@@ -36,6 +36,7 @@ import base64
 import gzip
 import json
 import os
+import random
 import re
 import threading
 import time
@@ -45,7 +46,7 @@ from urllib.parse import urlparse, parse_qs, quote, unquote
 import requests
 
 # ----------------------------------------------------------------- 1. config
-VERSION = "1.2.1"
+VERSION = "1.3.0"
 BRAND = "MovieLinkBD"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MLSBD_PUBLIC_URL", "").rstrip("/")
@@ -76,6 +77,23 @@ SEARCH_PATH = "/wp-json/mlmbd/v1/search"      # ?term=<q> -> [{link,title,image}
 # moment the challenge lifts.  The prefix (u7n8gg) rotates — update
 # LI_FRONT when the site moves.
 LI_FRONT = os.environ.get("MLSBD_LI_FRONT", "https://jxx3kk.movielinkbd.li")
+
+# Optional egress rotation for the Cloudflare-gated .li front (the moviebox
+# pattern): MLSBD_PROXY = one proxy URL, MLSBD_PROXY_LIST = comma-separated
+# pool.  Free datacenter proxies do NOT pass the site's Cloudflare gate
+# (verified 0/70 from ProxyScrape) — a residential/BD exit is required.
+# Only .li requests ride the proxy; the WordPress mirrors, the vircloud
+# signer and the metadata bridges stay direct.
+_PROXY_URL = os.environ.get("MLSBD_PROXY", "").strip()
+_PROXY_POOL = [u.strip() for u in os.environ.get("MLSBD_PROXY_LIST", "").split(",")
+               if u.strip()] or ([_PROXY_URL] if _PROXY_URL else [])
+
+
+def _li_proxies():
+    if not _PROXY_POOL:
+        return None
+    pick = random.choice(_PROXY_POOL)
+    return {"http": pick, "https": pick}
 SIGN_API = "https://dl.vircloud.site/api/sign/"
 HTTP_TIMEOUT = 12.0
 PROBE_TIMEOUT = 15.0
@@ -252,10 +270,16 @@ def li_search(term):
 
     Returns (status, rows) with status in {"ok", "blocked", "empty"}.
     """
-    try:
-        r = HTTP.get(LI_FRONT + "/search", params={"q": term},
-                     timeout=HTTP_TIMEOUT, headers={"Referer": LI_FRONT + "/"})
-    except Exception:
+    r = None
+    for attempt in range(2 if _PROXY_POOL else 1):
+        try:
+            r = HTTP.get(LI_FRONT + "/search", params={"q": term},
+                         timeout=HTTP_TIMEOUT, proxies=_li_proxies(),
+                         headers={"Referer": LI_FRONT + "/"})
+            break
+        except Exception:
+            r = None
+    if r is None:
         return "blocked", []
     if r.status_code == 403 or _li_challenge(r.text):
         return "blocked", []
@@ -286,7 +310,7 @@ def li_page_buttons(page_url):
     """
     files = []
     try:
-        r = HTTP.get(page_url, timeout=HTTP_TIMEOUT,
+        r = HTTP.get(page_url, timeout=HTTP_TIMEOUT, proxies=_li_proxies(),
                      headers={"Referer": LI_FRONT + "/"})
         if r.status_code != 200 or _li_challenge(r.text):
             return []
@@ -324,7 +348,8 @@ def li_button_links(entry):
     url = entry["front"] + "/" + entry["kind"] + "/" + entry["token"]
     try:
         r = HTTP.get(url, timeout=HTTP_TIMEOUT, stream=True,
-                     allow_redirects=True, headers={"Referer": LI_FRONT + "/"})
+                     allow_redirects=True, proxies=_li_proxies(),
+                     headers={"Referer": LI_FRONT + "/"})
         if r.status_code != 200 or _li_challenge(getattr(r, "text", "")):
             r.close()
             return []

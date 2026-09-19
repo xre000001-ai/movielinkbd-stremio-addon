@@ -387,6 +387,26 @@ class LiAdapterTests(unittest.TestCase):
         self.assertIn("https://cdn.example.com/video.mp4", urls)
         self.assertIn("https://dl.example.com/file-1080p.mkv", urls)
 
+    def test_li_requests_ride_configured_proxy(self):
+        addon._PROXY_POOL = ["http://proxygate.example:8000"]
+        try:
+            body = ('<div class="content"><a href="https://jxx3kk.movielinkbd.li/movie/x1" '
+                    'class="title">The Gift (2015)</a></div>')
+            seen = {}
+
+            def route(url, **kw):
+                if "/search" in url and "jxx3kk" in url:
+                    seen["proxies"] = kw.get("proxies")
+                    return FakeResponse(body=body)
+                return FakeResponse(status=404, body="{}")
+            with mock.patch.object(addon.HTTP, "get", side_effect=UrlRouter(route)):
+                addon.li_search("the gift")
+            self.assertEqual(seen.get("proxies"),
+                             {"http": "http://proxygate.example:8000",
+                              "https": "http://proxygate.example:8000"})
+        finally:
+            addon._PROXY_POOL = []
+
     def test_li_try_falls_back_when_blocked(self):
         cf = "<html><title>Just a moment...</title></html>"
         cinemeta = FakeResponse(json_value={"meta": {"name": "Interstellar",
