@@ -5,7 +5,8 @@ A source-aware Stremio addon for the public MovieLinkBD movie and web-series cat
 ## What it provides
 
 - Latest movie and series catalogs.
-- Separate MovieLinkBD catalogs for Bangla, Bollywood, Dual Audio, Anime, Drama, Animation and Horror.
+- Separate MovieLinkBD catalogs for Bangla, Hindi/Bollywood, Hindi Dubbed, English, Dual Audio, Web Series, Anime, Drama, Animation and Horror.
+- Uses MovieLinkBD's public WordPress REST data when available to distinguish movies from series without fetching every detail page during catalog building.
 - Search and pagination for the source pages that publish them.
 - Direct source poster URLs; lazy placeholders are not used.
 - Movie metadata and series episode lists parsed from MovieLinkBD detail pages.
