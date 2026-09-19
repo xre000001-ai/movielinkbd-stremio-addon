@@ -41,6 +41,14 @@ beamup host itself: all 403 "Just a moment"). The addon therefore:
 The rotating prefix (`u7n8gg`, previously `2f2w3j`) is configurable via the
 `MLSBD_LI_FRONT` env var.
 
+### Egress rotation (v1.3.0, moviebox pattern)
+
+`MLSBD_PROXY` = one proxy URL, `MLSBD_PROXY_LIST` = comma-separated pool —
+only the Cloudflare-gated `.li` front rides it (mirrors, signer and bridges
+stay direct). **A residential/BD exit is required**: 70 free ProxyScrape
+datacenter proxies were tested against the `.li` gate — **0 passed**. Free
+proxies are also useless for Dailymotion-style IP-dependent ladders (0/80).
+
 ## How it works
 
 1. `tt…` ids resolve through Cinemeta, `tmdb:` ids through TMDB
