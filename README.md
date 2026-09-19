@@ -65,11 +65,24 @@ pytest test_movielinkbd.py # 20 offline tests (mocked HTTP)
 
 ## Deploy (beamup)
 
-Procfile build (`web: python addon.py`), no Dockerfile:
+Procfile build (`web: python addon.py`), no Dockerfile.
+
+The public `git.baby-beamup.club` HTTPS front is not always in DNS; the
+durable path is the **dokku SSH remote** (GitHub-key based):
 
 ```
-git push beamup main:master --force
+# one-time: register your GitHub public key with the dokku host
+# (beamup-cli ships the shared sync key for this):
+node -e "require('<beamup-cli>/lib/ssh').syncGithubKeys(
+    {host: 'a.baby-beamup.club', githubUsername: '<github-user>')"
+
+git remote add beamup dokku@a.baby-beamup.club:<account-hash>/movielinkbd
+git push beamup master --force
 ```
+
+`<account-hash>` = `utils.hash("<github-user>")` from beamup-cli
+(`sha256`-derived; e.g. `xre000001-ai` → `3404d3c5dc63`, the prefix in the
+app URL `3404d3c5dc63-movielinkbd.baby-beamup.club`).
 
 ## Verification snapshots (2026-09-19, live)
 
