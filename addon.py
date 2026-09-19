@@ -45,7 +45,7 @@ from urllib.parse import urlparse, parse_qs, quote, unquote
 import requests
 
 # ----------------------------------------------------------------- 1. config
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 BRAND = "MovieLinkBD"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MLSBD_PUBLIC_URL", "").rstrip("/")
@@ -55,6 +55,10 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 
 # The movielinksbd family.  movielinkbd.tv is deliberately absent.
 MIRRORS = [
+    # User directive: the current movielinkbd.li front.  Cloudflare-gated
+    # from many datacenter IPs; the family mirrors below auto-answer when
+    # this one is challenged.
+    "https://u7n8gg.movielinkbd.li",
     "https://movieslinkbd.com",
     "https://movielink.ch",
     "https://movielinkbd.net",
@@ -591,6 +595,22 @@ class Handler(BaseHTTPRequestHandler):
                     {"ok": True, "addon": BRAND, "version": VERSION,
                      "uptime_s": round(time.time() - _START, 1),
                      "stats": STATS}))
+            if path == "/debug/li":
+                info = {}
+                for tag, url in (
+                        ("home", "https://u7n8gg.movielinkbd.li/"),
+                        ("wpjson", "https://u7n8gg.movielinkbd.li"
+                         "/wp-json/mlmbd/v1/search?term=interstellar"),
+                        ("sign", "https://dl.vircloud.site/api/sign/")):
+                    try:
+                        r = HTTP.get(url, timeout=HTTP_TIMEOUT,
+                                     headers={"User-Agent": UA})
+                        info[tag] = {"status": r.status_code,
+                                     "ctype": r.headers.get("Content-Type", ""),
+                                     "head": r.text[:90]}
+                    except Exception as exc:
+                        info[tag] = {"error": str(exc)[:90]}
+                return self._send(200, json.dumps(info))
             if path == "/logo.png":
                 return self._send(200, base64.b64decode(LOGO_B64), "image/png",
                                   {"Cache-Control": "public, max-age=86400"})
