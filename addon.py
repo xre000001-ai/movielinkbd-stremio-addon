@@ -45,7 +45,7 @@ from urllib.parse import urlparse, parse_qs, quote, unquote
 import requests
 
 # ----------------------------------------------------------------- 1. config
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 BRAND = "MovieLinkBD"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MLSBD_PUBLIC_URL", "").rstrip("/")
@@ -75,7 +75,7 @@ SEARCH_PATH = "/wp-json/mlmbd/v1/search"      # ?term=<q> -> [{link,title,image}
 # host too via /debug/li); the adapter stays armed and auto-activates the
 # moment the challenge lifts.  The prefix (u7n8gg) rotates — update
 # LI_FRONT when the site moves.
-LI_FRONT = os.environ.get("MLSBD_LI_FRONT", "https://u7n8gg.movielinkbd.li")
+LI_FRONT = os.environ.get("MLSBD_LI_FRONT", "https://jxx3kk.movielinkbd.li")
 SIGN_API = "https://dl.vircloud.site/api/sign/"
 HTTP_TIMEOUT = 12.0
 PROBE_TIMEOUT = 15.0
@@ -760,9 +760,9 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/debug/li":
                 info = {}
                 for tag, url in (
-                        ("home", "https://u7n8gg.movielinkbd.li/"),
-                        ("wpjson", "https://u7n8gg.movielinkbd.li"
-                         "/wp-json/mlmbd/v1/search?term=interstellar"),
+                        ("home", "https://jxx3kk.movielinkbd.li/"),
+                        ("search", "https://jxx3kk.movielinkbd.li"
+                         "/search?q=interstellar"),
                         ("sign", "https://dl.vircloud.site/api/sign/")):
                     try:
                         r = HTTP.get(url, timeout=HTTP_TIMEOUT,

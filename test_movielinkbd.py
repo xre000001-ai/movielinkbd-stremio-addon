@@ -402,7 +402,7 @@ class LiAdapterTests(unittest.TestCase):
         def route(url, **kw):
             if "cinemeta" in url:
                 return cinemeta
-            if "u7n8gg.movielinkbd.li" in url:
+            if addon.LI_FRONT in url:
                 return FakeResponse(status=403, body=cf)   # .li is CF-blocked
             if "wp-json" in url:
                 return wp
@@ -433,7 +433,7 @@ class LiAdapterTests(unittest.TestCase):
         def route(url, **kw):
             if "cinemeta" in url:
                 return cinemeta
-            if "/search" in url and "u7n8gg" in url:
+            if "/search" in url and addon.LI_FRONT in url:
                 return FakeResponse(body=search_body)
             if "/movie/hashgift" in url:
                 return FakeResponse(body=movie_page)
