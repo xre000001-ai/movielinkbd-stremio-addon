@@ -51,7 +51,10 @@ VERSION = "1.4.0"
 BRAND = "MovieLinkBD"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MLSBD_PUBLIC_URL", "").rstrip("/")
-TMDB_API_KEY = os.environ.get("MLSBD_TMDB_KEY", "1af06616dcbb28ff03088d87d63211f5")
+TMDB_API_KEY = os.environ.get("MLSBD_TMDB_KEY", "")
+# security: no hardcoded key in the public repo — set MLSBD_TMDB_KEY
+# in the environment (beamup config var / local env). tmdb:-id lookups
+# need it; tt- ids keep working via Cinemeta without any key.
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
 

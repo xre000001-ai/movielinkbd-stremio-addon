@@ -52,7 +52,7 @@ proxies are also useless for Dailymotion-style IP-dependent ladders (0/80).
 ## How it works
 
 1. `tt…` ids resolve through Cinemeta, `tmdb:` ids through TMDB
-   (key from `MLSBD_TMDB_KEY`, fleet default baked in).
+   (key from the `MLSBD_TMDB_KEY` env var — set it on your host; no key is committed).
 2. Site search via `/wp-json/mlmbd/v1/search?term=…` (HTML `?s=` fallback on
    the legacy mirror). The literal search is retried with the pre-colon head
    of the title — Cinemeta's *"Dune: Part One"* finds the site's *"Dune"*.
