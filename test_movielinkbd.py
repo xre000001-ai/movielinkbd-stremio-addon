@@ -469,6 +469,40 @@ class LiAdapterTests(unittest.TestCase):
         self.assertIn("700 MB", out["streams"][0]["name"])
 
 
+class TypeAwareResolveTests(unittest.TestCase):
+    """tmdb ids are per-kind: a movie id must not resolve against the TV table."""
+
+    def setUp(self):
+        reset_caches()
+
+    def test_movie_id_prefers_movie_table(self):
+        calls = []
+
+        def route(url, **kw):
+            calls.append(url)
+            if "/tv/27205" in url:
+                return FakeResponse(json_value={"name": "Alone in the Wild",
+                                                "first_air_date": "2009-01-01"})
+            if "/movie/27205" in url:
+                return FakeResponse(json_value={"title": "Inception",
+                                                "release_date": "2010-07-16"})
+            return FakeResponse(status=404, body="{}")
+        with mock.patch.object(addon.HTTP, "get", side_effect=UrlRouter(route)):
+            out = addon.resolve_id("tmdb:27205", media_type="movie")
+        self.assertEqual(out, ("Inception", 2010))
+        self.assertIn("/movie/27205", calls[0])
+
+    def test_series_id_prefers_tv_table(self):
+        def route(url, **kw):
+            if "/tv/9999" in url:
+                return FakeResponse(json_value={"name": "Some Show",
+                                                "first_air_date": "2021-01-01"})
+            return FakeResponse(status=404, body="{}")
+        with mock.patch.object(addon.HTTP, "get", side_effect=UrlRouter(route)):
+            out = addon.resolve_id("tmdb:9999", media_type="series")
+        self.assertEqual(out, ("Some Show", 2021))
+
+
 class ProxyPoolTests(unittest.TestCase):
     """v1.4.0 trained free-proxy pool (moviebox machinery)."""
 

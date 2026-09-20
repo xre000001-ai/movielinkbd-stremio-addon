@@ -47,7 +47,7 @@ from urllib.parse import urlparse, parse_qs, quote, unquote
 import requests
 
 # ----------------------------------------------------------------- 1. config
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 BRAND = "MovieLinkBD"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MLSBD_PUBLIC_URL", "").rstrip("/")
@@ -396,8 +396,14 @@ def _gzip(body):
 
 
 # --------------------------------------------------------------- 3. metadata
-def resolve_id(identifier):
-    """tt… -> Cinemeta, tmdb:… -> TMDB.  Returns (title, year) or None."""
+def resolve_id(identifier, media_type="movie"):
+    """tt… -> Cinemeta, tmdb:… -> TMDB.  Returns (title, year) or None.
+
+    media_type ("movie"/"series") decides which TMDB kind is queried FIRST:
+    tmdb ids are only unique per kind, so a movie id must not be resolved
+    against the TV table (tmdb:27205 is Inception the movie, but a TV show
+    sits on the same numeric id)."""
+    prefer = ["tv", "movie"] if media_type == "series" else ["movie", "tv"]
     # Normalise: keep "tmdb:<id>" whole, drop any trailing :season:episode.
     m = re.fullmatch(r"(tt\d+|tmdb:\d+)(?::\d+:\d+)?", (identifier or "").strip())
     base = m.group(1) if m else (identifier or "").strip()
@@ -419,16 +425,17 @@ def resolve_id(identifier):
                 year = _year_of(meta.get("releaseInfo") or meta.get("year"))
         elif lowered.startswith("tmdb"):
             tid = re.sub(r"^tmdb:?", "", base)
-            r = HTTP.get("https://api.themoviedb.org/3/tv/%s" % tid,
-                         params={"api_key": TMDB_API_KEY}, timeout=HTTP_TIMEOUT)
-            if r.status_code != 200:
-                r = HTTP.get("https://api.themoviedb.org/3/movie/%s" % tid,
-                             params={"api_key": TMDB_API_KEY}, timeout=HTTP_TIMEOUT)
-            if r.status_code == 200:
-                d = r.json() or {}
-                title = d.get("name") or d.get("title") or ""
-                date = d.get("first_air_date") or d.get("release_date") or ""
-                year = _year_of(date[:4])
+            for kind in prefer:
+                r = HTTP.get("https://api.themoviedb.org/3/%s/%s" % (kind, tid),
+                             params={"api_key": TMDB_API_KEY},
+                             timeout=HTTP_TIMEOUT)
+                if r.status_code == 200:
+                    d = r.json() or {}
+                    title = d.get("name") or d.get("title") or ""
+                    date = d.get("first_air_date") or d.get("release_date") or ""
+                    year = _year_of(date[:4])
+                    if title:
+                        break
     except Exception:
         return None
     title = clean_text(title)
@@ -814,7 +821,7 @@ def _li_try(title, year, is_series, season, episode):
     return {"streams": streams[:12], "message": ""}
 
 
-def build_streams(identifier, season=None, episode=None):
+def build_streams(identifier, season=None, episode=None, media_type="movie"):
     """Full pipeline: id -> mirror search -> page -> signed direct cards.
 
     Accepts both bare ids ("tt0816692", "tmdb:123") and Stremio series
@@ -826,7 +833,7 @@ def build_streams(identifier, season=None, episode=None):
         identifier = m.group(1)
         if episode is None and m.group(3):
             season, episode = int(m.group(2)), int(m.group(3))
-    resolved = resolve_id(identifier)
+    resolved = resolve_id(identifier, media_type)
     if not resolved:
         return {"streams": [], "message": "could not resolve the title id"}
     title, year = resolved
@@ -1017,13 +1024,14 @@ class Handler(BaseHTTPRequestHandler):
             m = re.fullmatch(r"/stream/movie/([A-Za-z0-9:]+)\.json", path)
             if m:
                 STATS["streams"] += 1
-                out = build_streams(m.group(1))
+                out = build_streams(m.group(1), media_type="movie")
                 STATS["cards"] += len(out.get("streams") or [])
                 return self._send(200, json.dumps(out))
             m = re.fullmatch(r"/stream/series/([A-Za-z0-9:]+):(\d+):(\d+)\.json", path)
             if m:
                 STATS["streams"] += 1
-                out = build_streams(m.group(1), int(m.group(2)), int(m.group(3)))
+                out = build_streams(m.group(1), int(m.group(2)),
+                                    int(m.group(3)), media_type="series")
                 STATS["cards"] += len(out.get("streams") or [])
                 return self._send(200, json.dumps(out))
             return self._send(404, json.dumps(
