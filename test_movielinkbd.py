@@ -469,6 +469,75 @@ class LiAdapterTests(unittest.TestCase):
         self.assertIn("700 MB", out["streams"][0]["name"])
 
 
+class ProxyPoolTests(unittest.TestCase):
+    """v1.4.0 trained free-proxy pool (moviebox machinery)."""
+
+    def setUp(self):
+        addon._FREE_POOL[0] = []
+        addon._POOL_BAD.clear()
+        addon._POOL_STATS.clear()
+        addon._POOL_STICKY[0] = None
+        addon._POOL_STICKY[1] = 0.0
+        addon._EXIT_BUSY.clear()
+        addon._POOL_TLS.url = None
+
+    def tearDown(self):
+        self.setUp()
+
+    def test_pick_prefers_sticky_and_scored(self):
+        addon._FREE_POOL[0] = ["http://a:1", "http://b:2"]
+        addon._POOL_STATS["http://a:1"] = {"ok": 9, "fail": 1, "lat": 300}
+        pick = addon._pool_pick()
+        self.assertEqual(pick["http"], "http://a:1")
+        # sticky after a good note
+        addon._POOL_TLS.url = "http://b:2"
+        addon._POOL_TLS.t_req = __import__("time").time()
+        addon._pool_note("good", 120)
+        self.assertEqual(addon._POOL_STICKY[0], "http://b:2")
+
+    def test_dead_exit_gets_benched(self):
+        addon._FREE_POOL[0] = ["http://dead:1"]
+        addon._POOL_TLS.url = "http://dead:1"
+        addon._POOL_TLS.t_req = __import__("time").time()
+        addon._pool_note("dead")
+        self.assertIn("http://dead:1", addon._POOL_BAD)
+        self.assertEqual(addon._pool_healthy(), [])
+
+    def test_refresh_parses_and_publishes_passing_exits(self):
+        listing = "\r\n".join([
+            "socks4://1.2.3.4:1080",
+            "http://10.0.0.1:8080", "http://10.0.0.2:3128", "http://10.0.0.3:80"])
+        calls = {"n": 0}
+
+        def fake_get(url, **kw):
+            calls["n"] += 1
+            if "proxyscrape" in url:
+                return FakeResponse(body=listing)
+            proxy = kw.get("proxies", {}).get("http", "")
+            if proxy == "http://10.0.0.2:3128":
+                return FakeResponse(body="<html>ok</html>")     # passes gate
+            return FakeResponse(status=403, body="Just a moment")
+        with mock.patch.object(addon.requests, "get", side_effect=fake_get):
+            addon._FREE_POOL_TS[0] = 0.0
+            addon._free_pool_refresh()
+        self.assertEqual(addon._FREE_POOL[0], ["http://10.0.0.2:3128"])
+
+    def test_li_get_rides_pool_and_learns(self):
+        addon._FREE_POOL[0] = ["http://p:9"]
+        seen = {}
+
+        def route(url, **kw):
+            if "jxx3kk" in url or addon.LI_FRONT in url:
+                seen["proxies"] = kw.get("proxies")
+                return FakeResponse(body="<html>fine</html>")
+            return FakeResponse(status=404, body="{}")
+        with mock.patch.object(addon.HTTP, "get", side_effect=UrlRouter(route)):
+            r = addon._li_get(addon.LI_FRONT + "/search?q=x")
+        self.assertIsNotNone(r)
+        self.assertEqual(seen["proxies"], {"http": "http://p:9", "https": "http://p:9"})
+        self.assertEqual(addon._POOL_STATS["http://p:9"]["ok"], 1)
+
+
 class ServerSmokeTests(unittest.TestCase):
     def test_routes_via_handler(self):
         import threading

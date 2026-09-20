@@ -39,6 +39,7 @@ import os
 import random
 import re
 import threading
+from concurrent.futures import ThreadPoolExecutor
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, quote, unquote
@@ -46,7 +47,7 @@ from urllib.parse import urlparse, parse_qs, quote, unquote
 import requests
 
 # ----------------------------------------------------------------- 1. config
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 BRAND = "MovieLinkBD"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MLSBD_PUBLIC_URL", "").rstrip("/")
@@ -78,22 +79,247 @@ SEARCH_PATH = "/wp-json/mlmbd/v1/search"      # ?term=<q> -> [{link,title,image}
 # LI_FRONT when the site moves.
 LI_FRONT = os.environ.get("MLSBD_LI_FRONT", "https://jxx3kk.movielinkbd.li")
 
-# Optional egress rotation for the Cloudflare-gated .li front (the moviebox
-# pattern): MLSBD_PROXY = one proxy URL, MLSBD_PROXY_LIST = comma-separated
-# pool.  Free datacenter proxies do NOT pass the site's Cloudflare gate
-# (verified 0/70 from ProxyScrape) — a residential/BD exit is required.
-# Only .li requests ride the proxy; the WordPress mirrors, the vircloud
-# signer and the metadata bridges stay direct.
+# Optional premium egress (moviebox pattern): MLSBD_PROXY / MLSBD_PROXY_LIST.
+# v1.4.0: the TRAINED FREE PROXY POOL is the primary rotation (moviebox
+# machinery): ProxyScrape list auto-refreshes every 4 min, a trainer probes
+# members every 90s against the actual .li gate, exits are benched/scored,
+# and the sticky-best exit serves a whole chain.  Only .li requests ride the
+# pool; mirrors, the vircloud signer and metadata bridges stay direct.
 _PROXY_URL = os.environ.get("MLSBD_PROXY", "").strip()
 _PROXY_POOL = [u.strip() for u in os.environ.get("MLSBD_PROXY_LIST", "").split(",")
                if u.strip()] or ([_PROXY_URL] if _PROXY_URL else [])
 
+_FREE_POOL_SRC = os.environ.get(
+    "MLSBD_PROXY_SOURCE",
+    "https://api.proxyscrape.com/v4/free-proxy-list/get"
+    "?request=display_proxies&proxy_format=protocolipport&format=text").strip()
+_FREE_POOL = [[]]                   # trained free exits (auto-refreshed)
+_FREE_POOL_TS = [0.0]
+_FREE_POOL_LOCK = threading.Lock()
+_FREE_POOL_ON = [False]             # daemon pool only when run as a server
+_POOL_BAD = {}                      # exit -> benched-until ts
+_POOL_STICKY = [None, 0.0]
+_POOL_STATS = {}                    # exit -> {"ok","fail","lat"}
+_POOL_TLS = threading.local()
+_POOL_REBUILD_TS = [0.0]
+_EXIT_BUSY = {}
 
-def _li_proxies():
-    if not _PROXY_POOL:
+
+def _pool_all():
+    with _FREE_POOL_LOCK:
+        free = [u for u in _FREE_POOL[0] if u]
+    if free:
+        return list(dict.fromkeys(free))
+    return list(dict.fromkeys(_PROXY_POOL))
+
+
+def _pool_healthy():
+    now = time.time()
+    return [u for u in _pool_all() if _POOL_BAD.get(u, 0.0) <= now]
+
+
+def _pool_pick():
+    """Trained pick: sticky exit, then best Laplace-scored healthy exit
+    with <2 requests in flight; anything when all are benched."""
+    now = time.time()
+    with _FREE_POOL_LOCK:
+        sticky = _POOL_STICKY[0] if _POOL_STICKY[1] > now else None
+        bad = {u for u, t in _POOL_BAD.items() if t > now}
+    allp = _pool_all()
+    healthy = [u for u in allp if u not in bad]
+
+    def _score(u):
+        st = _POOL_STATS.get(u) or {}
+        ok, fail = st.get("ok", 0), st.get("fail", 0)
+        lat = st.get("lat") or 4000
+        return ((ok + 1.0) / (ok + fail + 2.0)) * (4000.0 / max(lat, 250))
+
+    if sticky and (sticky in healthy or (sticky in allp and not healthy)) \
+            and _EXIT_BUSY.get(sticky, 0) < 2:
+        u = sticky
+    elif healthy:
+        ranked = sorted(healthy, key=_score, reverse=True)
+        u = next((x for x in ranked if _EXIT_BUSY.get(x, 0) < 2), None) or ranked[0]
+    elif allp:
+        u = random.choice(allp)
+    else:
         return None
-    pick = random.choice(_PROXY_POOL)
-    return {"http": pick, "https": pick}
+    _POOL_TLS.url = u
+    _POOL_TLS.t_req = time.time()
+    return {"http": u, "https": u}
+
+
+def _exit_busy_inc(u):
+    if u:
+        _EXIT_BUSY[u] = _EXIT_BUSY.get(u, 0) + 1
+
+
+def _exit_busy_dec(u):
+    if u:
+        n = _EXIT_BUSY.get(u, 0) - 1
+        if n > 0:
+            _EXIT_BUSY[u] = n
+        else:
+            _EXIT_BUSY.pop(u, None)
+
+
+def _pool_note(kind, ms=None):
+    """Learn from this thread's last pool transport: good | dead | block."""
+    u = getattr(_POOL_TLS, "url", None)
+    if not u:
+        return
+    if ms is None:
+        ms = int((time.time() - getattr(_POOL_TLS, "t_req", time.time())) * 1000)
+    _POOL_TLS.url = None
+    now = time.time()
+    st = _POOL_STATS.setdefault(u, {"ok": 0, "fail": 0, "lat": None})
+    if kind == "good":
+        st["ok"] += 1
+        st["lat"] = ms if st["lat"] is None else int(0.6 * st["lat"] + 0.4 * ms)
+        with _FREE_POOL_LOCK:
+            _POOL_BAD.pop(u, None)
+            _POOL_STICKY[0], _POOL_STICKY[1] = u, now + 120
+        return
+    st["fail"] += 1
+    dur = 600 if kind == "dead" else 1800
+    with _FREE_POOL_LOCK:
+        _POOL_BAD[u] = max(_POOL_BAD.get(u, 0.0), now + dur)
+        if _POOL_STICKY[0] == u:
+            _POOL_STICKY[0] = None
+    if (_FREE_POOL_ON[0] and len(_pool_healthy()) < 3
+            and now - _POOL_REBUILD_TS[0] > 30):
+        _POOL_REBUILD_TS[0] = now
+        threading.Thread(target=_free_pool_refresh, daemon=True).start()
+
+
+def _li_probe(u, timeout=6):
+    """Trainer probe: does this exit pass the .li Cloudflare gate?"""
+    t0 = time.time()
+    try:
+        rr = requests.get(LI_FRONT + "/", timeout=timeout,
+                          proxies={"http": u, "https": u},
+                          headers={"User-Agent": UA})
+        if rr.status_code == 200 and "Just a moment" not in rr.text[:3000]:
+            return "good", int((time.time() - t0) * 1000)
+        if rr.status_code in (403, 406, 429, 503):
+            return "block", None
+        return None, None
+    except Exception:
+        return "dead", None
+
+
+def _free_pool_refresh():
+    """Fetch the public list, probe http:// samples against the real gate,
+    keep the fastest passing exits merged with known-healthy members."""
+    now = time.time()
+    if (not _FREE_POOL_SRC) or (now - _FREE_POOL_TS[0] < 240):
+        return
+    _FREE_POOL_TS[0] = now
+    try:
+        r = requests.get(_FREE_POOL_SRC, timeout=20)
+        cand = [u.strip() for u in r.text.replace("\r", "").splitlines()
+                if u.strip().startswith("http://")]
+        cand = random.sample(cand, min(150, len(cand))) if cand else []
+        if not cand:
+            return
+
+        def _probe_batch(batch):
+            got = []
+            with ThreadPoolExecutor(max_workers=25) as ex:
+                for u, res in zip(batch, ex.map(lambda x: _li_probe(x, 5), batch)):
+                    if res[0] == "good":
+                        got.append((u, res[1]))
+            return got
+
+        with _FREE_POOL_LOCK:
+            prev = [u for u in _FREE_POOL[0] if _POOL_BAD.get(u, 0.0) <= now]
+
+        def _publish(members):
+            with _FREE_POOL_LOCK:
+                _FREE_POOL[0] = list(members)[:20]
+
+        alive = _probe_batch(cand[:60])
+        _publish(dict.fromkeys(prev + [u for u, _ in sorted(alive, key=lambda x: x[1])[:20]]))
+        if len(cand) > 60:
+            alive += _probe_batch(cand[60:])
+        alive.sort(key=lambda x: x[1])
+        merged = sorted(dict.fromkeys(prev + [u for u, _ in alive]),
+                        key=lambda u: next((m for uu, m in alive if uu == u), 9999))
+        _publish(merged)
+        with _FREE_POOL_LOCK:
+            for u, ms in alive:
+                st = _POOL_STATS.setdefault(u, {"ok": 0, "fail": 0, "lat": None})
+                st["ok"] += 1
+                st["lat"] = ms if st["lat"] is None else int(0.6 * st["lat"] + 0.4 * ms)
+                _POOL_BAD.pop(u, None)
+    except Exception:
+        pass                            # keep the previous pool; retry next cycle
+
+
+def _pool_train_once():
+    members = _pool_all()
+    if not members:
+        return
+    with ThreadPoolExecutor(max_workers=20) as ex:
+        for u, res in zip(members, ex.map(_li_probe, members)):
+            _POOL_TLS.url = u
+            _POOL_TLS.t_req = time.time()
+            try:
+                _pool_note(res[0], res[1])
+            except Exception:
+                pass
+            _POOL_TLS.url = None
+
+
+def _pool_train_loop():
+    while True:
+        try:
+            if _FREE_POOL_ON[0]:
+                _pool_train_once()
+        except Exception:
+            pass
+        time.sleep(90)
+
+
+def _free_pool_loop():
+    while True:
+        try:
+            _free_pool_refresh()
+        except Exception:
+            pass
+        time.sleep(240)
+
+
+def _li_get(url, timeout=None):
+    """GET a .li URL through the trained pool (direct fallback when the
+    pool is empty).  Learns exit quality from every outcome."""
+    timeout = timeout or HTTP_TIMEOUT
+    headers = {"Referer": LI_FRONT + "/"}
+    if not _pool_all():
+        try:
+            return HTTP.get(url, timeout=timeout, headers=headers)
+        except Exception:
+            return None
+    last = None
+    for _attempt in range(2):
+        proxies = _pool_pick()
+        u = proxies.get("http") if proxies else None
+        _exit_busy_inc(u)
+        t0 = time.time()
+        try:
+            r = HTTP.get(url, timeout=timeout, headers=headers, proxies=proxies)
+            ms = int((time.time() - t0) * 1000)
+            if r.status_code == 200 and not _li_challenge(r.text):
+                _pool_note("good", ms)
+                return r
+            _pool_note("block")
+            last = r
+        except Exception:
+            _pool_note("dead")
+            last = None
+        finally:
+            _exit_busy_dec(u)
+    return last
 SIGN_API = "https://dl.vircloud.site/api/sign/"
 HTTP_TIMEOUT = 12.0
 PROBE_TIMEOUT = 15.0
@@ -270,15 +496,8 @@ def li_search(term):
 
     Returns (status, rows) with status in {"ok", "blocked", "empty"}.
     """
-    r = None
-    for attempt in range(2 if _PROXY_POOL else 1):
-        try:
-            r = HTTP.get(LI_FRONT + "/search", params={"q": term},
-                         timeout=HTTP_TIMEOUT, proxies=_li_proxies(),
-                         headers={"Referer": LI_FRONT + "/"})
-            break
-        except Exception:
-            r = None
+    search_url = LI_FRONT + "/search"
+    r = _li_get(search_url)
     if r is None:
         return "blocked", []
     if r.status_code == 403 or _li_challenge(r.text):
@@ -309,14 +528,11 @@ def li_page_buttons(page_url):
     source on this app).
     """
     files = []
-    try:
-        r = HTTP.get(page_url, timeout=HTTP_TIMEOUT, proxies=_li_proxies(),
-                     headers={"Referer": LI_FRONT + "/"})
-        if r.status_code != 200 or _li_challenge(r.text):
-            return []
-        body = r.text
-    except Exception:
+    r = _li_get(page_url)
+    if r is None or getattr(r, "status_code", 0) != 200 \
+            or _li_challenge(getattr(r, "text", "")):
         return []
+    body = getattr(r, "text", "") or ""
     for m in re.finditer(
             r'<a[^>]+href="([^"]*?)/(getWatch|getLink)/([A-Za-z0-9+/=_-]{20,})"[^>]*>(.*?)</a>',
             body, re.S):
@@ -346,17 +562,11 @@ def li_button_links(entry):
     redirects are all accepted.  Positive-only: nothing is guessed.
     """
     url = entry["front"] + "/" + entry["kind"] + "/" + entry["token"]
-    try:
-        r = HTTP.get(url, timeout=HTTP_TIMEOUT, stream=True,
-                     allow_redirects=True, proxies=_li_proxies(),
-                     headers={"Referer": LI_FRONT + "/"})
-        if r.status_code != 200 or _li_challenge(getattr(r, "text", "")):
-            r.close()
-            return []
-        body = r.text if hasattr(r, "text") else ""
-        r.close()
-    except Exception:
+    r = _li_get(url)
+    if r is None or getattr(r, "status_code", 0) != 200 \
+            or _li_challenge(getattr(r, "text", "")):
         return []
+    body = getattr(r, "text", "") or ""
     urls = []
     for u in FILE_URL_RE.findall(body):
         if u not in urls:
@@ -826,6 +1036,9 @@ _START = time.time()
 
 
 def main():
+    _FREE_POOL_ON[0] = True
+    threading.Thread(target=_free_pool_loop, daemon=True).start()
+    threading.Thread(target=_pool_train_loop, daemon=True).start()
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     print("%s %s listening on :%d" % (BRAND, VERSION, PORT), flush=True)
     server.serve_forever()
